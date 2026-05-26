@@ -1,0 +1,22 @@
+# WizardMath-13B (model_tag: wm)
+# Best setting: uniform 4-bit, lr=0.02, 5 epochs (per_epoch eval).
+# Best result: GSM8K acc = 0.6368 at epoch 2.
+
+model_root: 'your_path'
+wm:
+  base_model: Llama-2-13b-hf
+  finetuned: WizardMath-13B-V1.0
+  calib_dataset: metamath
+  rank_min: 2
+  num_train_samples: 10000
+  quant_train_epoch: 5
+  train_data_source: metamath
+  learning_rate: 0.02
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  train_batch_size: 1
+  grad_accum: 8
+  lm_loss_weight: 1.0
+  layer_recon_loss_weight: 3000
+  logit_distill_weight: 1.0
