@@ -1,0 +1,39 @@
+# BEiT-3 base (224 pretrained → 480 COCO-Captioning fine-tuned) — UltraDelta Table 5
+# Used by main.py (--model_tag beit3).
+model_root: ./data/models
+beit3:
+  # .pth checkpoints (unilm format, NOT HF-style directories)
+  base_ckpt: ./data/models/beit3_base_pretrained/beit3_base_patch16_224.pth
+  ft_ckpt:   ./data/models/beit3_base_patch16_480_coco_captioning.pth
+  tokenizer_dir: ./data/models/beit3_base_coco_captioning
+  spm_path:  ./data/models/beit3_base_pretrained/beit3.spm
+  sentencepiece_model: ./data/models/beit3_base_pretrained/beit3.spm
+  data_path: ./data/coco
+
+  # Compression hyperparameters
+  alpha: 0.0625
+  group_size: 128
+  bits: 4
+  seed: 0
+
+  # Post-quant tuning (captioning) hyperparameters
+  train_data_source: coco_captioning
+  num_train_samples: 2000
+  quant_train_epoch: 1
+  quant_param_train_epoch: 0
+  captioning_mask_prob: 0.6
+  label_smoothing: 0.1
+  drop_worst_ratio: 0.0
+  drop_worst_after: 0
+  caption_loss_weight: 1.0
+  layer_recon_loss_weight: 3000.0
+  logit_distill_weight: 1.0
+
+  # COCO eval
+  coco_data_path: ./data/coco
+  karpathy_split: test
+  num_beams: 3
+  num_max_bpe_tokens: 64
+  length_penalty: 0.6
+  vocab_size: 64010
+  img_size: 480
