@@ -1,4 +1,25 @@
-"""Packed-v1 I/O, calibration loaders, training-data prep, CLI/YAML helpers."""
+'''
+***********************************************************************
+SAGE-D: Sensitivity-Aware Delta Compression for Task-Specific Fine-Tuned
+        Foundation Models
+
+This software may be used only for research evaluation purposes.
+For other purposes (e.g., commercial), please contact the authors.
+
+-----------------------------------------------------
+File: utils.py
+- I/O                  : packed-v1 serialization (8-field per-layer dict
+                         + meta) for compressed/tuned checkpoints.
+- Calibration loaders  : c4, MetaMathQA, MBPP, Alpaca (chat-template aware)
+                         packed into fixed-length token sequences.
+- Training data prep   : Magicoder OSS+Evol, MetaMathQA (with prompt-prefix
+                         label masking), Alpaca; per-tag default dispatcher.
+- CLI / YAML helpers   : argparse-driven pipeline flags, nested-block YAML
+                         loader, pretty-print helpers.
+
+Version: 1.0
+***********************************************************************
+'''
 
 from __future__ import annotations
 
@@ -559,7 +580,7 @@ def get_args(argv=None):
     parser.add_argument("--config", type=str, default="./config.yaml",
                         help="Path to config file")
     parser.add_argument("--model_tag", type=str, required=True,
-                        choices=["wm", "mc", "chat", "llava"],
+                        choices=["wm", "mc", "chat", "llava", "beit3"],
                         help="Which model_tag block of config.yaml to use")
     parser.add_argument("--save_root", type=str, required=True,
                         help="Output dir; delta/compressed/tuned go inside")
@@ -585,8 +606,43 @@ def get_args(argv=None):
 
     parser.add_argument("--save_per_epoch", action="store_true", default=False)
     parser.add_argument("--llava_template", type=str, default=None,
-                        help="(llava + train_data_source=llava_multimodal) "
-                             "path to llava-1.5-7b-hf reference dir")
+                        help="(llava) path to liuhaotian llava-v1.5-{7b,13b} "
+                             "reference dir; used as merge_llava template")
+    parser.add_argument("--llava_template_hf", type=str, default=None,
+                        help="(llava) path to llava-hf llava-1.5-{7b,13b}-hf "
+                             "reference dir; used by convert_llava_to_hf to "
+                             "inject vision_tower + processor aux files")
+    parser.add_argument("--eval_limit", type=int, default=0,
+                        help="Cap number of eval items (smoke testing). "
+                             "0 = full eval. Maps to gsm8k end / llava n_max / "
+                             "beit3 limit. (mc/EvalPlus ignores this cap.)")
+
+    # BEiT-3-only options (ignored when model_tag != 'beit3').
+    parser.add_argument("--sentencepiece_model", type=str, default=None,
+                        help="(beit3) Path to beit3.spm SentencePiece model.")
+    parser.add_argument("--tokenizer_dir", type=str, default=None,
+                        help="(beit3) HF tokenizer directory mirror.")
+    parser.add_argument("--data_path", type=str, default=None,
+                        help="(beit3) COCO data root containing dataset_coco.json.")
+    parser.add_argument("--captioning_mask_prob", type=float, default=0.6,
+                        help="(beit3) Token mask probability for captioning.")
+    parser.add_argument("--label_smoothing", type=float, default=0.1,
+                        help="(beit3) Label smoothing for BertCaptioningLoss.")
+    parser.add_argument("--drop_worst_ratio", type=float, default=0.0,
+                        help="(beit3) Drop-worst loss ratio.")
+    parser.add_argument("--drop_worst_after", type=int, default=0,
+                        help="(beit3) Step threshold to enable drop-worst.")
+    parser.add_argument("--caption_loss_weight", type=float, default=1.0,
+                        help="(beit3) Captioning CE loss weight.")
+    parser.add_argument("--num_max_bpe_tokens", type=int, default=64,
+                        help="(beit3) Max BPE tokens per caption.")
+    parser.add_argument("--img_size", type=int, default=480,
+                        help="(beit3) Image size for the captioning model.")
+    parser.add_argument("--quant_param_train_epoch", type=int, default=0,
+                        help="(beit3) Pre-A/B scale/zero tuning epochs.")
+    parser.add_argument("--tuning_1", action="store_true", default=False,
+                        help="(SAGE_D parity) Use rank=1 A/B stack; ignored "
+                             "by current LLM/LLaVA flow.")
     return parser.parse_args(argv)
 
 

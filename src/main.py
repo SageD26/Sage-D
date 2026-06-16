@@ -1,4 +1,31 @@
-"""Sage-D pipeline entry point: SVD -> compress -> tune -> merge -> eval."""
+'''
+***********************************************************************
+SAGE-D: Sensitivity-Aware Delta Compression for Task-Specific Fine-Tuned
+        Foundation Models
+
+This software may be used only for research evaluation purposes.
+For other purposes (e.g., commercial), please contact the authors.
+
+-----------------------------------------------------
+File: main.py
+- End-to-end pipeline entry point.
+- Stage 1 (SVD)         : delta computation + per-layer SVD + alpha-budget
+                          rank allocation guided by sensitivity scores.
+- Stage 2 (Compress)    : per-group beta absorption + Hadamard rotation
+                          + uniform 4-bit asymmetric quantization.
+- Stage 3 (Tune)        : post-quantization fine-tuning of per-module A/B
+                          gain vectors (Adam, LM CE + layer-recon MSE +
+                          logit-distill KL).
+- Stage 4 (Merge)       : dequantize + add to base; emit a HF model dir
+                          (LLM/LLaVA) or unilm .pth (BEiT-3).
+- Stage 5 (Eval)        : task-specific evaluation (GSM8K / MBPP / GQA /
+                          TextVQA / COCO Karpathy captioning).
+- BEiT-3 follows a dedicated early-exit branch (separate model class
+  and submodule prefixes); LLM/LLaVA share the inline flow below.
+
+Version: 1.0
+***********************************************************************
+'''
 
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -16,6 +43,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from model import (
     merge,
     merge_llava,
+    convert_llava_to_hf,
 
     collect_activation_covariance,
     r_probe_from_alpha,
@@ -37,6 +65,11 @@ from model import (
     _TuneArgs,
     train_post_quant,
     _export_module_to_packed,
+
+    build_delta_m3_beit3,
+    compress_pipeline_beit3,
+    run_tuning_beit3,
+    merge_beit3,
 )
 from utils import (
     load_packed, save_packed, get_calibration, prep_train_data,
@@ -82,7 +115,7 @@ if __name__ == "__main__":
     os.makedirs(args.save_root, exist_ok=True)
 
     paths = derive_paths(args.save_root, args.model_tag)
-    paths["data_root"]  = "'your_path'"
+    paths["data_root"]  = os.environ.get("DATA_ROOT", "./data/datasets")
     paths["merged"]     = os.path.join(args.save_root, ".result", "merged", args.model_tag)
     paths["eval_out"]   = os.path.join(args.save_root, ".result", "logs",   args.model_tag)
     os.makedirs(os.path.dirname(paths["merged"]),   exist_ok=True)
@@ -101,17 +134,158 @@ if __name__ == "__main__":
     _print_table("PATHS", paths)
 
 
+    # ------------------------------------------------------------------
+    # BEiT-3 early-exit branch.
+    # BEiT-3 is loaded from unilm .pth files (not HF dirs) and the encoder
+    # lives at student.beit3.encoder.* — none of the LLaMA-specific code
+    # below applies. Delegate to the dedicated build_delta_m3_beit3 ->
+    # compress_pipeline_beit3 -> run_tuning_beit3 -> merge_beit3 helpers,
+    # then call evaluate() on the merged .pth.
+    # ------------------------------------------------------------------
+    if args.model_tag == "beit3":
+        def _cfg_or_cli(key, default=None):
+            v = cfg_tag.get(key) if isinstance(cfg_tag, dict) else None
+            if v is None:
+                v = getattr(args, key, None)
+            return v if v is not None else default
+
+        base_ckpt = _cfg_or_cli("base_ckpt")
+        ft_ckpt   = _cfg_or_cli("ft_ckpt")
+        spm_path  = (_cfg_or_cli("sentencepiece_model")
+                     or _cfg_or_cli("spm_path"))
+        tok_dir   = _cfg_or_cli("tokenizer_dir")
+        data_path = _cfg_or_cli("data_path", "./data/coco")
+        if not base_ckpt or not ft_ckpt or not spm_path:
+            raise ValueError(
+                "beit3 requires base_ckpt, ft_ckpt, sentencepiece_model/spm_path "
+                "in the YAML (or via CLI overrides).")
+
+        alpha       = float(_cfg_or_cli("alpha", args.alpha))
+        bits        = int(_cfg_or_cli("bits", args.bits))
+        group_size  = int(_cfg_or_cli("group_size", args.group_size))
+        img_size    = int(_cfg_or_cli("img_size", args.img_size))
+        n_train     = int(_cfg_or_cli("num_train_samples", 2000))
+        n_epoch     = int(_cfg_or_cli("quant_train_epoch", 1))
+        n_qp_epoch  = int(_cfg_or_cli("quant_param_train_epoch", 0))
+
+        print(f"[main:beit3] base={base_ckpt}")
+        print(f"[main:beit3] ft  ={ft_ckpt}")
+        print(f"[main:beit3] spm ={spm_path}")
+        print(f"[main:beit3] tok ={tok_dir}")
+
+        t0 = time.time()
+        build_delta_m3_beit3(
+            base_ckpt=base_ckpt, ft_ckpt=ft_ckpt,
+            save_path=paths["delta"],
+            alpha=alpha, group_size=group_size, bits=bits,
+            device=args.device,
+        )
+        compress_pipeline_beit3(
+            delta_path=paths["delta"], save_path=paths["compressed"],
+            alpha=alpha, bits=bits, group_size=group_size,
+            seed=args.seed, device=args.device,
+        )
+        run_tuning_beit3(
+            compressed_path=paths["compressed"],
+            delta_path=paths["delta"],
+            base_ckpt=base_ckpt, ft_ckpt=ft_ckpt,
+            save_path=paths["tuned"],
+            spm_path=spm_path, data_path=data_path,
+            tokenizer_dir=tok_dir,
+            num_train_samples=n_train,
+            train_batch_size=int(_cfg_or_cli("train_batch_size",
+                                              args.train_batch_size if hasattr(args, "train_batch_size") else 1)),
+            grad_accum=int(_cfg_or_cli("grad_accum", 1)),
+            quant_train_epoch=n_epoch,
+            learning_rate=float(_cfg_or_cli("learning_rate", 1e-3)),
+            weight_decay=float(_cfg_or_cli("weight_decay", 0.0)),
+            warmup_ratio=float(_cfg_or_cli("warmup_ratio", 0.1)),
+            max_grad_norm=float(_cfg_or_cli("max_grad_norm", 1.0)),
+            caption_loss_weight=float(_cfg_or_cli("caption_loss_weight", 1.0)),
+            layer_recon_loss_weight=float(_cfg_or_cli("layer_recon_loss_weight", 3000.0)),
+            logit_distill_weight=float(_cfg_or_cli("logit_distill_weight", 1.0)),
+            captioning_mask_prob=float(_cfg_or_cli("captioning_mask_prob", args.captioning_mask_prob)),
+            label_smoothing=float(_cfg_or_cli("label_smoothing", args.label_smoothing)),
+            drop_worst_ratio=float(_cfg_or_cli("drop_worst_ratio", args.drop_worst_ratio)),
+            drop_worst_after=int(_cfg_or_cli("drop_worst_after", args.drop_worst_after)),
+            num_max_bpe_tokens=int(_cfg_or_cli("num_max_bpe_tokens", args.num_max_bpe_tokens)),
+            img_size=img_size,
+            save_per_epoch=args.save_per_epoch,
+            seed=args.seed, device=args.device,
+            quant_param_train_epoch=n_qp_epoch,
+            tuning_1=args.tuning_1,
+        )
+
+        # Free the training stage's CUDA allocator pool before merge + eval
+        # (student/teacher BEiT-3 + DeltaSVDLinear_QUANT modules leave ~tens
+        # of GB cached; on shared GPUs this can OOM downstream).
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        merged_pth = paths["merged"] + ".pth"
+        os.makedirs(os.path.dirname(merged_pth), exist_ok=True)
+        merge_beit3(
+            base_ckpt=base_ckpt, ft_ckpt=ft_ckpt,
+            packed_path=paths["tuned"], save_path=merged_pth,
+        )
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        os.makedirs(paths["eval_out"], exist_ok=True)
+        eval_limit = int(_cfg_or_cli("eval_limit", args.eval_limit or 0))
+        eval_results = evaluate(
+            model_tag="beit3",
+            model_dir=merged_pth,
+            data_root=paths["data_root"],
+            output_dir=paths["eval_out"],
+            eval_limit=eval_limit,
+            beit3_data_path=data_path,
+            beit3_tokenizer_dir=tok_dir,
+            beit3_img_size=img_size,
+        )
+        import json as _json
+        print("=" * 60)
+        print(f"EVAL RESULTS — model_tag=beit3")
+        print("=" * 60)
+        print(_json.dumps(eval_results, indent=2, default=str))
+        summary_path = os.path.join(paths["eval_out"], "summary.json")
+        with open(summary_path, "w") as _f:
+            _json.dump(eval_results, _f, indent=2, default=str)
+        print(f"\nsummary.json: {summary_path}")
+        print(f"\n[done-beit3] wall = {time.time() - t0:.1f}s")
+        sys.exit(0)
+    # ------------------------------------------------------------------
+
+
+    def _resolve_model_path(name: str, subdir: str) -> str:
+        """Find <model_root>/<subdir>/<name>; fall back to <model_root>/<name>.
+        wm/mc use the base_model/finetuned_model subdirs; LLaVA puts both at
+        the model_root top level.
+        """
+        with_sub = os.path.join(config["model_root"], subdir, name)
+        if os.path.isdir(with_sub):
+            return with_sub
+        flat = os.path.join(config["model_root"], name)
+        if os.path.isdir(flat):
+            return flat
+        # default to with_sub so missing-path errors point at the conventional layout
+        return with_sub
+
+    _base_path = _resolve_model_path(cfg_tag["base_model"], "base_model")
+    _ft_path   = _resolve_model_path(cfg_tag["finetuned"],  "finetuned_model")
     base_mod = AutoModelForCausalLM.from_pretrained(
-        os.path.join(config["model_root"], "base_model", cfg_tag["base_model"]),
+        _base_path,
         torch_dtype=torch.bfloat16,
     ).to(args.device)
     ft_mod = AutoModelForCausalLM.from_pretrained(
-        os.path.join(config["model_root"], "finetuned_model", cfg_tag["finetuned"]),
+        _ft_path,
         torch_dtype=torch.bfloat16,
     ).to(args.device)
-    tok = AutoTokenizer.from_pretrained(
-        os.path.join(config["model_root"], "finetuned_model", cfg_tag["finetuned"])
-    )
+    tok = AutoTokenizer.from_pretrained(_ft_path)
 
 
     original_bit = next(iter(base_mod.parameters())).element_size() * 8
@@ -298,12 +472,8 @@ if __name__ == "__main__":
     t0 = time.time()
 
     train_data_source = cfg_tag.get("train_data_source")
-    base_model_path = os.path.join(
-        config["model_root"], "base_model", cfg_tag["base_model"]
-    )
-    ft_model_path = os.path.join(
-        config["model_root"], "finetuned_model", cfg_tag["finetuned"]
-    )
+    base_model_path = _resolve_model_path(cfg_tag["base_model"], "base_model")
+    ft_model_path   = _resolve_model_path(cfg_tag["finetuned"],  "finetuned_model")
 
 
     if not torch.cuda.is_available():
@@ -472,6 +642,15 @@ if __name__ == "__main__":
             delta_path=paths["tuned"],
             save_path=paths["merged"],
         )
+        # merge_llava writes liuhaotian format; convert_llava_to_hf rewrites
+        # it as llava-hf format that vLLM / evaluate_llava_* can load.
+        if not args.llava_template_hf:
+            raise ValueError("--llava_template_hf required for model_tag=llava "
+                             "(e.g. /path/to/llava-1.5-7b-hf)")
+        hf_dir = paths["merged"] + "_hf"
+        convert_llava_to_hf(src=paths["merged"], dst=hf_dir,
+                             reference=args.llava_template_hf)
+        paths["merged"] = hf_dir
     else:
         merge(
             finetuned_model=ft_model_path,
@@ -502,11 +681,16 @@ if __name__ == "__main__":
 
     os.makedirs(paths["eval_out"], exist_ok=True)
     t0 = time.time()
+    _eval_limit = (cfg_tag.get("eval_limit", 0)
+                   if isinstance(cfg_tag, dict) else 0) or args.eval_limit or 0
+    _llava_tasks = cfg_tag.get("llava_tasks") if isinstance(cfg_tag, dict) else None
     eval_results = evaluate(
         model_tag=args.model_tag,
         model_dir=paths["merged"],
         data_root=paths["data_root"],
         output_dir=paths["eval_out"],
+        eval_limit=int(_eval_limit),
+        llava_tasks=_llava_tasks,
     )
     print(f"\n[stage 5] wall = {time.time() - t0:.1f}s")
 

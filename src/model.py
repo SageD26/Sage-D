@@ -1,4 +1,35 @@
-"""SVD, compression, DeltaSVDLinear training, and merge utilities."""
+'''
+***********************************************************************
+SAGE-D: Sensitivity-Aware Delta Compression for Task-Specific Fine-Tuned
+        Foundation Models
+
+This software may be used only for research evaluation purposes.
+For other purposes (e.g., commercial), please contact the authors.
+
+-----------------------------------------------------
+File: model.py
+- Core algorithm + delta-compression primitives.
+- SVD pipeline       : per-layer SVD of (W_ft - W_base); covariance-aware
+                       sensitivity scoring; total-rank-budget allocation
+                       proportional to sensitivity.
+- Compression        : per-group golden-section beta search; block /
+                       full Hadamard rotation; asymmetric uint8 quantization
+                       of U and V_T factors.
+- Quantized module   : DeltaSVDLinear (un-quantized) / DeltaSVDLinear_QUANT
+                       (uint8 with per-group scales + per-rank A/B gains).
+- Post-quant tuning  : layer-recon hooks; AdamW + linear warmup + cosine
+                       decay; LM CE + layer-recon MSE + logit-distillation
+                       KL composite loss.
+- Merge              : dequantize -> reconstruct delta -> add to base;
+                       per-tag serializers (HF state-dict / liuhaotian
+                       LLaVA / unilm BEiT-3).
+- BEiT-3 path        : separate vendor-aware variants of the above (model
+                       attribute paths and packed-v1 schema differ from
+                       the LLM/LLaVA path).
+
+Version: 1.0
+***********************************************************************
+'''
 
 from __future__ import annotations
 
@@ -988,7 +1019,9 @@ class DeltaSVDLinear_QUANT(nn.Module):
 
 
 def change_model_quant(model, quant_bit, group_size,
-                       param_dtype=torch.bfloat16):
+                       param_dtype=torch.bfloat16,
+                       decoder=None,
+                       allowed_bits=None):
     """
     Replace every DeltaSVDLinear in the model with DeltaSVDLinear_QUANT in place.
 
@@ -1000,10 +1033,14 @@ def change_model_quant(model, quant_bit, group_size,
         quant_bit: Uniform quantization bit-width.
         group_size: Group size along the rank axis.
         param_dtype: Storage dtype for the new quantized modules.
+        decoder: Optional override for the layer container (defaults to model.model,
+            i.e. the standard LLaMA decoder). Pass `student.beit3.encoder` for BEiT-3.
+        allowed_bits: Accepted for SAGE_D-compat; currently ignored (uniform `quant_bit`).
 
     Returns:
         The input model with modules swapped in place.
     """
+    del allowed_bits  # accepted for API parity; uniform quant_bit only
     def replace(mod):
         """
         Recursively walk a module subtree and swap DeltaSVDLinear children for quantized ones.
@@ -1018,14 +1055,19 @@ def change_model_quant(model, quant_bit, group_size,
                     param_dtype=param_dtype))
             else:
                 replace(child)
-    for layer in tqdm(model.model.layers, desc="Quantizing"):
+    dec = decoder if decoder is not None else model.model
+    for layer in tqdm(dec.layers, desc="Quantizing"):
         replace(layer)
     return model
 
 
 def _build_delta_svd_modules_from_delta(base_model, delta_sd: dict,
                                         group_size: int,
-                                        device: str):
+                                        device: str,
+                                        decoder=None,
+                                        submodule_names=None,
+                                        prefix_fn=None,
+                                        tuning_1: bool = False):
     """
     Replace base_model's targeted Linears with DeltaSVDLinear modules from a delta state dict.
 
@@ -1039,17 +1081,24 @@ def _build_delta_svd_modules_from_delta(base_model, delta_sd: dict,
         delta_sd: Dict mapping prefixed keys (.U/.S/.V/.base) to tensors.
         group_size: Group size along the rank axis; ranks must be multiples.
         device: Device to move the model to after building.
+        decoder: Optional override for the layer container (defaults to base_model.model).
+        submodule_names: Optional list of submodule paths (defaults to LINEAR_SUBMODULE_NAMES).
+        prefix_fn: Optional callable(layer_idx, submodule_name) -> delta_sd key prefix.
+        tuning_1: Accepted for SAGE_D API parity; currently ignored.
 
     Returns:
         The same `base_model` instance with DeltaSVDLinear modules attached.
     """
+    del tuning_1
     param_d = torch.bfloat16
-    decoder = base_model.model
-    num_layers = len(decoder.layers)
+    dec = decoder if decoder is not None else base_model.model
+    sub_names = submodule_names if submodule_names is not None else LINEAR_SUBMODULE_NAMES
+    pfn = prefix_fn if prefix_fn is not None else (lambda li, sn: f"model.layers.{li}.{sn}")
+    num_layers = len(dec.layers)
     n_built = 0
     for li in tqdm(range(num_layers), desc="Build DeltaSVDLinear"):
-        for sn in LINEAR_SUBMODULE_NAMES:
-            prefix = f"model.layers.{li}.{sn}"
+        for sn in sub_names:
+            prefix = pfn(li, sn)
             U_key = f"{prefix}.U"
             if U_key not in delta_sd:
                 continue
@@ -1070,7 +1119,7 @@ def _build_delta_svd_modules_from_delta(base_model, delta_sd: dict,
                 in_features=in_f, out_features=out_f, param_dtype=param_d,
             )
             parts = sn.split(".")
-            parent = decoder.layers[li].get_submodule(".".join(parts[:-1]))
+            parent = dec.layers[li].get_submodule(".".join(parts[:-1]))
             setattr(parent, parts[-1], new_mod)
             n_built += 1
     base_model.to(device)
@@ -1079,7 +1128,10 @@ def _build_delta_svd_modules_from_delta(base_model, delta_sd: dict,
 
 
 def _restore_beta_absorb_and_hadamard(model, meta: dict, group_size: int,
-                                        seed: int = 0):
+                                        seed: int = 0,
+                                        decoder=None,
+                                        submodule_names=None,
+                                        key_fn=None):
     """
     Replay per-group beta absorption and Hadamard rotation on every DeltaSVDLinear.
 
@@ -1092,14 +1144,19 @@ def _restore_beta_absorb_and_hadamard(model, meta: dict, group_size: int,
         meta: Metadata dict from compressed.pt; must contain 'betas' mapping.
         group_size: Group size along the rank axis used during compression.
         seed: Seed for the torch.Generator driving the random-orthogonal fallback.
+        decoder: Optional override for the layer container (defaults to model.model).
+        submodule_names: Optional list (defaults to LINEAR_SUBMODULE_NAMES).
+        key_fn: Optional callable(layer_idx, submodule_name) -> meta["betas"] key.
     """
     betas_map = meta.get("betas", {})
     generator = torch.Generator().manual_seed(seed)
 
-    decoder = model.model
+    dec = decoder if decoder is not None else model.model
+    sub_names = submodule_names if submodule_names is not None else LINEAR_SUBMODULE_NAMES
+    kfn = key_fn if key_fn is not None else (lambda li, sn: f"layers.{li}.{sn}")
     n_done = 0
-    for li, layer in enumerate(decoder.layers):
-        for sn in LINEAR_SUBMODULE_NAMES:
+    for li, layer in enumerate(dec.layers):
+        for sn in sub_names:
             try:
                 mod = layer.get_submodule(sn)
             except AttributeError:
@@ -1107,7 +1164,7 @@ def _restore_beta_absorb_and_hadamard(model, meta: dict, group_size: int,
             if not isinstance(mod, DeltaSVDLinear):
                 continue
 
-            key = f"layers.{li}.{sn}"
+            key = kfn(li, sn)
             beta_list = betas_map.get(key)
             if beta_list is None:
                 raise KeyError(f"compressed.pt meta has no betas for {key}")
@@ -1141,7 +1198,10 @@ def _restore_beta_absorb_and_hadamard(model, meta: dict, group_size: int,
     print(f"[replay] beta-absorb + hadamard on {n_done} modules.")
 
 
-def _load_quant_state_from_compressed(model, per_layer_packed: dict):
+def _load_quant_state_from_compressed(model, per_layer_packed: dict,
+                                       decoder=None,
+                                       submodule_names=None,
+                                       prefix_fn=None):
     """
     Overwrite each DeltaSVDLinear_QUANT's quantized state with values from compressed.pt.
 
@@ -1152,18 +1212,23 @@ def _load_quant_state_from_compressed(model, per_layer_packed: dict):
     Parameters:
         model: HF causal LM hosting DeltaSVDLinear_QUANT modules.
         per_layer_packed: Mapping from layer prefix to the 8-field packed dict.
+        decoder: Optional override for the layer container (defaults to model.model).
+        submodule_names: Optional list (defaults to LINEAR_SUBMODULE_NAMES).
+        prefix_fn: Optional callable(layer_idx, submodule_name) -> per_layer_packed key.
     """
-    decoder = model.model
+    dec = decoder if decoder is not None else model.model
+    sub_names = submodule_names if submodule_names is not None else LINEAR_SUBMODULE_NAMES
+    pfn = prefix_fn if prefix_fn is not None else (lambda li, sn: f"model.layers.{li}.{sn}")
     n_done = 0
-    for li, layer in enumerate(decoder.layers):
-        for sn in LINEAR_SUBMODULE_NAMES:
+    for li, layer in enumerate(dec.layers):
+        for sn in sub_names:
             try:
                 mod = layer.get_submodule(sn)
             except AttributeError:
                 continue
             if not isinstance(mod, DeltaSVDLinear_QUANT):
                 continue
-            prefix = f"model.layers.{li}.{sn}"
+            prefix = pfn(li, sn)
             packed = per_layer_packed[prefix]
             mod.U_int.data.copy_(packed["U_q"].to(mod.U_int.device))
             mod.V_T_int.data.copy_(packed["V_T_q"].to(mod.V_T_int.device))
@@ -1684,3 +1749,1086 @@ def merge_llava(template_dir: str, base_model: str,
         shutil.copy2(f, save_path)
     for f in glob.glob(os.path.join(template_dir, 'model.safetensors.index.json')):
         shutil.copy2(f, save_path)
+
+# ======================================================================
+# Ported from SAGE_D: LLaVA HF-format conversion + BEiT-3 captioning pipeline.
+# ======================================================================
+def _llava_remap_key(k: str) -> str | None:
+    if k.startswith("lm_head."):
+        return "language_model." + k
+    if k.startswith("model.embed_tokens.") or k.startswith("model.norm."):
+        return "language_model." + k
+    if k.startswith("model.layers."):
+        return "language_model." + k
+    if k.startswith("model.vision_tower.vision_tower."):
+        return k.replace("model.vision_tower.vision_tower.", "vision_tower.", 1)
+    if k.startswith("model.mm_projector.0."):
+        return k.replace("model.mm_projector.0.", "multi_modal_projector.linear_1.", 1)
+    if k.startswith("model.mm_projector.2."):
+        return k.replace("model.mm_projector.2.", "multi_modal_projector.linear_2.", 1)
+    return k
+
+
+def convert_llava_to_hf(src: str, dst: str, reference: str):
+    """Convert liuhaotian LLaVA dir (output of merge_llava) to transformers-
+    native llava-hf format so vLLM / llava_vqa_eval can load it.
+
+    Args:
+        src:        liuhaotian-format dir (merge_llava output).
+        dst:        output llava-hf dir.
+        reference:  llava-hf reference dir (e.g. llava-1.5-7b-hf) used to
+                    inject vision_tower + embed/lm_head and copy aux files.
+    """
+    import glob
+    import shutil
+    from pathlib import Path
+    from safetensors.torch import load_file as st_load
+    from safetensors.torch import save_file as st_save
+
+    src_p = Path(src); dst_p = Path(dst); ref_p = Path(reference)
+    dst_p.mkdir(parents=True, exist_ok=True)
+
+    # 1. Load source shards (bin or safetensors).
+    bin_files = sorted(glob.glob(str(src_p / "pytorch_model-*.bin")))
+    safetensors_files = sorted(glob.glob(str(src_p / "*.safetensors")))
+    sd: dict = {}
+    if bin_files:
+        for f in bin_files:
+            print(f"[convert] loading {f}")
+            sd.update(torch.load(f, map_location="cpu", weights_only=False))
+    elif safetensors_files:
+        for f in safetensors_files:
+            print(f"[convert] loading {f}")
+            sd.update(st_load(f))
+    else:
+        raise RuntimeError(f"No weights under {src_p}")
+    print(f"[convert] loaded {len(sd)} keys from src")
+
+    # 2. Remap to llava-hf naming.
+    new_sd: dict = {}
+    for k, v in sd.items():
+        nk = _llava_remap_key(k)
+        if nk is None:
+            continue
+        new_sd[nk] = v
+    print(f"[convert] remapped to {len(new_sd)} keys")
+
+    # 2b. Inject vision_tower + embed/lm_head from llava-hf reference.
+    print(f"[convert] injecting vision_tower + embed/lm_head from {ref_p}")
+    ref_safetensors = sorted(glob.glob(str(ref_p / "*.safetensors")))
+    n_vision = n_embed = 0
+    for f in ref_safetensors:
+        ref_sd = st_load(f)
+        for k, v in ref_sd.items():
+            if k.startswith("vision_tower."):
+                new_sd[k] = v
+                n_vision += 1
+            elif k in ("language_model.model.embed_tokens.weight",
+                       "language_model.lm_head.weight"):
+                new_sd[k] = v
+                n_embed += 1
+    print(f"[convert] injected {n_vision} vision_tower + {n_embed} embed/lm_head keys")
+
+    # 3. Save as a single safetensors file.
+    out_safetensors = dst_p / "model.safetensors"
+    print(f"[convert] saving → {out_safetensors}")
+    new_sd = {k: (v.contiguous() if hasattr(v, "contiguous") else v)
+              for k, v in new_sd.items()}
+    st_save(new_sd, str(out_safetensors))
+
+    # 4. Copy config + tokenizer + processor from reference.
+    aux_files = [
+        "config.json", "generation_config.json", "preprocessor_config.json",
+        "processor_config.json", "tokenizer.json", "tokenizer.model",
+        "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json",
+        "chat_template.json", "chat_template.jinja",
+    ]
+    for f in aux_files:
+        sf = ref_p / f
+        if sf.exists():
+            shutil.copy2(sf, dst_p / f)
+
+    # 5. Param-count summary.
+    counts = {"vision": 0, "projector": 0, "lm": 0, "other": 0}
+    for k in new_sd:
+        if k.startswith("vision_tower."):
+            counts["vision"] += new_sd[k].numel()
+        elif k.startswith("multi_modal_projector."):
+            counts["projector"] += new_sd[k].numel()
+        elif k.startswith("language_model."):
+            counts["lm"] += new_sd[k].numel()
+        else:
+            counts["other"] += new_sd[k].numel()
+    print(f"[convert] param counts: " + ", ".join(
+        f"{k}={v/1e6:.0f}M" for k, v in counts.items()))
+
+
+# ======================================================================
+# BEiT-3 post-quant tuning (analog of run_tuning for LLM/LLaVA)
+#
+# BEiT-3 is loaded from unilm .pth checkpoints (not HF dirs). The
+# 3-stage pipeline mirrors the LLM/LLaVA path:
+#   build_delta_m3_beit3  ->  beit3_delta.pt
+#   compress_pipeline_beit3 -> beit3_compressed.pt (packed_v1 + meta)
+#   run_tuning_beit3      ->  beit3_tuned.pt (A_stack/B_stack trained)
+#   merge_beit3           ->  result/merged/*.pth (unilm sd format)
+# ======================================================================
+
+LINEAR_SUBMODULE_NAMES_BEIT3 = [
+    "self_attn.q_proj.A", "self_attn.q_proj.B",
+    "self_attn.k_proj.A", "self_attn.k_proj.B",
+    "self_attn.v_proj.A", "self_attn.v_proj.B",
+    "self_attn.out_proj.A", "self_attn.out_proj.B",
+    "ffn.A.fc1", "ffn.A.fc2",
+    "ffn.B.fc1", "ffn.B.fc2",
+]
+
+
+def _beit3_prefix(li: int, sn: str) -> str:
+    return f"beit3.encoder.layers.{li}.{sn}"
+
+
+def _beit3_betas_key(li: int, sn: str) -> str:
+    # Same convention as LLM compress_pipeline (rooted at layers.*, no
+    # model-class prefix). Stored verbatim inside meta["betas"].
+    return f"layers.{li}.{sn}"
+
+
+def _beit3_load_unilm_sd(path: str) -> dict:
+    sd = torch.load(path, map_location="cpu", weights_only=False)
+    return sd.get("model", sd) if isinstance(sd, dict) else sd
+
+
+def _is_beit3_target_weight(k: str) -> bool:
+    """Filter for BEiT-3 encoder linear weights:
+      beit3.encoder.layers.{N}.self_attn.{q,k,v,out}_proj.{A,B}.weight
+      beit3.encoder.layers.{N}.ffn.{A,B}.{fc1,fc2}.weight
+    Excludes layer norms, embeddings, and the mlm_head."""
+    if not k.endswith(".weight"):
+        return False
+    if ".encoder.layers." not in k:
+        return False
+    if any(s in k for s in (
+        "self_attn.q_proj.", "self_attn.k_proj.",
+        "self_attn.v_proj.", "self_attn.out_proj.",
+    )):
+        return True
+    if ".ffn.A.fc" in k or ".ffn.B.fc" in k:
+        return True
+    return False
+
+
+def _is_beit3_target_bias(k: str) -> bool:
+    if not k.endswith(".bias"):
+        return False
+    if ".encoder.layers." not in k:
+        return False
+    if any(s in k for s in (
+        "self_attn.q_proj.", "self_attn.k_proj.",
+        "self_attn.v_proj.", "self_attn.out_proj.",
+    )):
+        return True
+    if ".ffn.A.fc" in k or ".ffn.B.fc" in k:
+        return True
+    return False
+
+
+def _beit3_alpha_rank_budget(layer_specs, alpha, original_bit=16,
+                              quant_bit=4, group_size=128):
+    """alpha-based rank budget for BEiT-3 (one budget across all encoder
+    linears; per-layer ranks are allocated proportionally afterwards)."""
+    total = 0
+    for spec in layer_specs:
+        dense_bytes = spec["in_dim"] * spec["out_dim"] * original_bit / 8.0
+        target_bytes = alpha * dense_bytes
+        per_rank = (spec["in_dim"] + spec["out_dim"]) * quant_bit / 8.0
+        r_target = max(group_size, int(target_bytes / per_rank))
+        cap = min(spec["in_dim"], spec["out_dim"])
+        total += min(r_target, cap)
+    return total
+
+
+def _beit3_alloc_ranks(layer_specs, target_total, group_size, r_min_units):
+    total_score = sum(spec["score"] for spec in layer_specs) + 1e-9
+    out = {}
+    for spec in layer_specs:
+        cap = min(spec["in_dim"], spec["out_dim"])
+        share = target_total * spec["score"] / total_score
+        r = int(round(share))
+        r = max(r_min_units, min(r, cap))
+        # snap to multiple of group_size
+        out[spec["name"]] = max(group_size, (r // group_size) * group_size)
+    return out
+
+
+def build_delta_m3_beit3(base_ckpt: str,
+                         ft_ckpt: str,
+                         save_path: str,
+                         alpha: float = 0.0625,
+                         group_size: int = 128,
+                         bits: int = 4,
+                         device: str = "cuda",
+                         **_ignored):
+    """Data-free per-linear delta SVD over BEiT-3 encoder linears.
+    Saves U/S/V/base (group_size-aligned ranks) + uncompressed bias_delta
+    in the same on-disk schema as LLM build_delta_m3 (keys = prefix + .U/.S/.V/.base)."""
+    device = device if torch.cuda.is_available() else "cpu"
+    print(f"[svd-beit3] base={base_ckpt}")
+    print(f"[svd-beit3] ft  ={ft_ckpt}")
+    base_sd = _beit3_load_unilm_sd(base_ckpt)
+    ft_sd = _beit3_load_unilm_sd(ft_ckpt)
+
+    targets = [k for k in ft_sd
+               if _is_beit3_target_weight(k)
+               and k in base_sd
+               and ft_sd[k].shape == base_sd[k].shape]
+    print(f"[svd-beit3] {len(targets)} linear weights selected")
+
+    cache = {}
+    layer_specs = []
+    for k in tqdm(targets, desc="SVD"):
+        w_ft = ft_sd[k].to(device=device, dtype=torch.float32)
+        w_b = base_sd[k].to(device=device, dtype=torch.float32)
+        delta = w_ft - w_b
+        out_dim, in_dim = delta.shape
+        score = float(delta.norm().item())
+        U, S, V = torch.svd(delta)
+        cache[k] = (U.detach().cpu().to(torch.float16),
+                    S.detach().cpu().to(torch.float32),
+                    V.detach().cpu().to(torch.float16),
+                    w_b.detach().cpu())
+        layer_specs.append({"name": k, "in_dim": in_dim, "out_dim": out_dim,
+                            "score": score})
+        del delta, w_ft, w_b, U, S, V
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    R_total = _beit3_alpha_rank_budget(layer_specs, alpha,
+                                        original_bit=16, quant_bit=bits,
+                                        group_size=group_size)
+    ranks = _beit3_alloc_ranks(layer_specs, R_total, group_size,
+                                r_min_units=group_size)
+    r_vals = list(ranks.values())
+    print(f"[svd-beit3] alpha={alpha} R_total={R_total} "
+          f"rank min/mean/max = {min(r_vals)}/"
+          f"{sum(r_vals)/len(r_vals):.1f}/{max(r_vals)}  sum={sum(r_vals)}")
+
+    param_dict = {}
+    for k, (U, S, V, base) in cache.items():
+        r = int(ranks[k])
+        prefix = k[:-len(".weight")]
+        param_dict[f"{prefix}.base"] = base.to(torch.bfloat16)
+        param_dict[f"{prefix}.U"] = U[:, :r].contiguous().to(torch.bfloat16)
+        param_dict[f"{prefix}.S"] = S[:r].contiguous().to(torch.bfloat16)
+        param_dict[f"{prefix}.V"] = V[:, :r].contiguous().to(torch.bfloat16)
+
+    # Bias deltas (uncompressed) on the same modules.
+    n_bias = 0
+    for k in ft_sd:
+        if not _is_beit3_target_bias(k):
+            continue
+        if k not in base_sd:
+            continue
+        bd_key = k[:-len(".bias")] + ".bias_delta"
+        param_dict[bd_key] = (ft_sd[k] - base_sd[k]).to(torch.float16).detach().cpu()
+        n_bias += 1
+    print(f"[svd-beit3] captured {n_bias} bias_delta entries")
+
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    torch.save(param_dict, save_path)
+    print(f"[svd-beit3] wrote {save_path}")
+
+
+def compress_pipeline_beit3(delta_path: str,
+                            save_path: str,
+                            alpha: float = 0.0625,
+                            bits: int = 4,
+                            group_size: int = 128,
+                            hadamard: bool = True,
+                            beta_steps: int = 11,
+                            seed: int = 0,
+                            device: str = "cuda",
+                            hadamard_mode: str = "full",
+                            **_ignored):
+    """BEiT-3 analog of compress_pipeline. Loads beit3_delta.pt, runs
+    compress_layer (which always applies β-absorb + Hadamard internally),
+    and writes packed_v1 with format="beit3_packed_v1" and meta containing
+    `betas` / `hadamard_mode` / `seed` so run_tuning_beit3 can replay the
+    exact un-quantized U/V_T as a layer-recon teacher."""
+    device = device if torch.cuda.is_available() else "cpu"
+
+    print(f"[compress-beit3] loading {delta_path}")
+    delta_sd = torch.load(delta_path, map_location="cpu")
+
+    # Enumerate prefixes from delta_sd.
+    layer_prefixes = sorted({k[:-len(".U")] for k in delta_sd
+                              if k.endswith(".U")})
+    print(f"[compress-beit3] {len(layer_prefixes)} linear prefixes; "
+          f"bits={bits}, group_size={group_size}, "
+          f"hadamard={hadamard}, hadamard_mode={hadamard_mode}")
+
+    generator = torch.Generator().manual_seed(seed)
+    out_sd: dict = {}
+    beta_records: dict = {}
+    total_err = 0.0
+    count = 0
+    for prefix in tqdm(layer_prefixes, desc="Compressing"):
+        # prefix example: beit3.encoder.layers.0.self_attn.q_proj.A
+        try:
+            li = int(prefix.split(".encoder.layers.")[1].split(".")[0])
+            sn_parts = prefix.split(f".encoder.layers.{li}.")[1]
+            beta_key = _beit3_betas_key(li, sn_parts)
+        except Exception:
+            beta_key = prefix  # fallback (still unique)
+
+        U = delta_sd[f"{prefix}.U"].to(device)
+        S = delta_sd[f"{prefix}.S"].to(device)
+        V = delta_sd[f"{prefix}.V"].to(device)
+        rank = S.shape[0]
+        packed, beta_list = compress_layer(U, S, V, bits=bits,
+                                            group_size=group_size,
+                                            generator=generator)
+        # sanity: reconstruct
+        with torch.no_grad():
+            delta_full = U.float() @ torch.diag(S.float()) @ V.float().T
+            delta_q = reconstruct_delta(packed, group_size).to(delta_full.device)
+            err = ((delta_q - delta_full).norm()
+                    / delta_full.norm().clamp_min(1e-8)).item()
+            total_err += err
+            count += 1
+
+        for field, tensor in packed.items():
+            out_sd[f"{prefix}.{field}"] = tensor.cpu() if hasattr(tensor, "cpu") else tensor
+        out_sd[f"{prefix}.__rank"] = torch.tensor(int(rank), dtype=torch.long)
+        beta_records[beta_key] = beta_list
+        del U, S, V, packed, delta_q, delta_full
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    print(f"[compress-beit3] avg rel-error = {total_err / max(1, count):.3e}")
+
+    # Passthrough bias_delta entries.
+    n_bias = 0
+    for k, t in delta_sd.items():
+        if k.endswith(".bias_delta"):
+            out_sd[k] = t
+            n_bias += 1
+    print(f"[compress-beit3] passthrough {n_bias} bias_delta entries")
+
+    out_sd["__meta__"] = {
+        "format": "beit3_packed_v1",
+        "alpha": float(alpha),
+        "group_size": int(group_size),
+        "bits": int(bits),
+        "n_linear": len(layer_prefixes),
+        "n_bias_delta": n_bias,
+        "betas": beta_records,
+        "hadamard": bool(hadamard),
+        "hadamard_mode": hadamard_mode,
+        "seed": int(seed),
+    }
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    torch.save(out_sd, save_path)
+    print(f"[compress-beit3] wrote {save_path}")
+
+
+def _train_loop_beit3_captioning(student, teacher, train_loader, args_ns,
+                                   device, num_epochs: int,
+                                   trainable_predicate, phase_name: str,
+                                   epoch_callback=None):
+    """BEiT-3 captioning post-quant training loop.
+
+    Loss = caption_loss_weight * BertCaptioningLoss(student_logits, masked_labels, global_step)
+         + layer_recon_loss_weight * mean(two-stage recon per QUANT module)
+         + logit_distill_weight   * KL(softmax(teacher_logits) || log_softmax(student_logits))
+    """
+    # Local copy of vendor BertCaptioningLoss (vendor utils.py would pull
+    # torchmetrics/tensorboardX at import time, which we avoid).
+    BertCaptioningLoss = _BertCaptioningLoss
+
+    params = _set_requires_grad(student, trainable_predicate)
+    if len(params) == 0:
+        print(f"[{phase_name}] no trainable params; skipping.")
+        return
+
+    optimizer = torch.optim.AdamW(
+        params, lr=args_ns.learning_rate, weight_decay=args_ns.weight_decay,
+        betas=(0.9, 0.999), eps=1e-8,
+    )
+    total_steps = max(1, len(train_loader) * num_epochs // args_ns.grad_accum)
+    warmup_steps = max(1, int(total_steps * args_ns.warmup_ratio))
+    scheduler = _build_sched(optimizer, total_steps, warmup_steps,
+                              args_ns.learning_rate)
+
+    autocast = lambda: torch.amp.autocast("cuda", dtype=torch.bfloat16)
+
+    criterion = BertCaptioningLoss(
+        getattr(args_ns, "label_smoothing", 0.1),
+        getattr(args_ns, "drop_worst_ratio", 0.0),
+        getattr(args_ns, "drop_worst_after", 0),
+    )
+
+    recon_reset, recon_total, recon_remove = install_layer_recon_hooks(student)
+
+    print(f"[{phase_name}] trainable tensors={len(params)}, "
+          f"total_steps={total_steps}, warmup={warmup_steps}, "
+          f"lr={args_ns.learning_rate}")
+
+    global_step = 0
+    try:
+        for epoch in range(num_epochs):
+            student.train()
+            pbar = tqdm(train_loader,
+                        desc=f"[{phase_name}] epoch {epoch+1}/{num_epochs}")
+            optimizer.zero_grad()
+
+            for bi, batch in enumerate(pbar):
+                image = batch["image"].to(device=device, dtype=torch.bfloat16)
+                lang_tokens = batch["language_tokens"].to(device)
+                masked_tokens = batch["masked_tokens"].to(device)
+                padding_mask = batch["padding_mask"].to(device)
+                lang_masked_pos = batch["language_masked_pos"].to(device)
+
+                with torch.no_grad(), autocast():
+                    ref_logits, _ = teacher(
+                        image=image, text_ids=masked_tokens,
+                        padding_mask=padding_mask,
+                        language_masked_pos=lang_masked_pos,
+                    )
+                ref_logits = ref_logits.detach()
+
+                with autocast():
+                    recon_reset()
+                    stu_logits, _ = student(
+                        image=image, text_ids=masked_tokens,
+                        padding_mask=padding_mask,
+                        language_masked_pos=lang_masked_pos,
+                    )
+                    masked_labels = lang_tokens[lang_masked_pos.bool()]
+                    caption = criterion(stu_logits.float(), masked_labels,
+                                         global_step)
+
+                    recon = recon_total()
+                    if recon is None:
+                        recon = torch.zeros((), device=device,
+                                             dtype=torch.float32)
+                    vmin = min(stu_logits.shape[-1], ref_logits.shape[-1])
+                    log_p = F.log_softmax(stu_logits[..., :vmin].float(), dim=-1)
+                    p_ref = F.softmax(ref_logits[..., :vmin].float(), dim=-1)
+                    distill = F.kl_div(log_p, p_ref, reduction="batchmean")
+
+                    cap_w = args_ns.caption_loss_weight * caption
+                    recon_w = args_ns.layer_recon_loss_weight * recon
+                    distill_w = args_ns.logit_distill_weight * distill
+                    loss = cap_w + recon_w + distill_w
+
+                (loss / args_ns.grad_accum).backward()
+
+                if (bi + 1) % args_ns.grad_accum == 0:
+                    torch.nn.utils.clip_grad_norm_(params, args_ns.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+
+                pbar.set_postfix({
+                    "cap": f"{caption.item():.3f}({cap_w.item():.2f})",
+                    "rec": f"{recon.item():.3f}({recon_w.item():.2f})",
+                    "kd":  f"{distill.item():.3f}({distill_w.item():.2f})",
+                    "tot": f"{loss.item():.2f}",
+                    "lr":  f"{optimizer.param_groups[0]['lr']:.2e}",
+                })
+
+                # Release iteration locals + drain CUDA cache periodically.
+                # Without this, BEiT-3 training on shared GPUs grows by a few
+                # hundred MB / iter from autocast f32 master copies + stale
+                # graph leaves still referenced by these locals across iters,
+                # OOMing after ~250 iters on a 96 GB-free GPU.
+                del image, lang_tokens, masked_tokens, padding_mask
+                del lang_masked_pos, stu_logits, ref_logits, log_p, p_ref
+                del caption, recon, distill, cap_w, recon_w, distill_w, loss
+                # Aggressive empty_cache every iter — BEiT-3 captioning has
+                # variable padding lengths per caption which fragments the
+                # CUDA allocator pool; w/o this the process bloats to >100 GB
+                # over ~470 iters.
+                torch.cuda.empty_cache()
+
+            if epoch_callback is not None:
+                epoch_callback(epoch + 1, student)
+    finally:
+        recon_remove()
+    student.eval()
+
+
+_BEIT3_VENDOR_CACHE: dict = {}
+
+
+def _load_packed_beit3(path: str):
+    """BEiT-3 variant of utils.load_packed. Accepts format="beit3_packed_v1"
+    and tolerates extra per-layer entries (`__rank`) plus uncompressed
+    `*.bias_delta` passthrough keys (they're skipped during per-layer
+    grouping)."""
+    from utils import PACKED_FIELDS  # local re-import (root utils)
+    flat = torch.load(path, map_location="cpu", weights_only=False)
+    meta = flat.pop("__meta__", None)
+    if not isinstance(meta, dict):
+        raise ValueError(f"{path} has no __meta__ dict")
+    if meta.get("format") not in ("packed_v1", "beit3_packed_v1"):
+        raise ValueError(
+            f"{path} unsupported meta format {meta.get('format')!r}; "
+            f"expected packed_v1 or beit3_packed_v1.")
+    per_layer: dict[str, dict] = {}
+    for k, v in flat.items():
+        if k.endswith(".bias_delta"):
+            continue
+        if k.endswith(".__rank"):
+            continue
+        prefix, field = k.rsplit(".", 1)
+        per_layer.setdefault(prefix, {})[field] = v
+    # Validate that the 8 quant fields are present per prefix.
+    for prefix, packed in per_layer.items():
+        missing = [f for f in PACKED_FIELDS if f not in packed]
+        if missing:
+            raise ValueError(f"{prefix} missing fields {missing} in {path}")
+    return per_layer, meta
+
+
+class _BertCaptioningLoss(nn.Module):
+    """Inline copy of beit3_vendor.utils.BertCaptioningLoss.
+
+    Avoids loading vendor utils.py (which pulls torchmetrics/tensorboardX
+    at module import time)."""
+
+    def __init__(self, label_smoothing, drop_worst_ratio, drop_worst_after):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+        self.drop_worst_ratio = drop_worst_ratio
+        self.drop_worst_after = drop_worst_after
+        self.log_soft = nn.LogSoftmax(dim=1)
+        self.kl = nn.KLDivLoss(reduction='none')
+
+    def forward(self, logits, target, iter):
+        eps = self.label_smoothing
+        n_class = logits.size(1)
+        one_hot = torch.zeros_like(logits).scatter(1, target.view(-1, 1), 1)
+        one_hot = one_hot * (1 - eps) + (1 - one_hot) * eps / (n_class - 1)
+        log_prb = self.log_soft(logits)
+        loss = self.kl(log_prb, one_hot).sum(1)
+        if self.drop_worst_ratio > 0 and iter > self.drop_worst_after:
+            loss, _ = torch.topk(
+                loss,
+                k=int(loss.shape[0] * (1 - self.drop_worst_ratio)),
+                largest=False,
+            )
+        return loss.mean()
+
+
+def _merge_batch_tensors_by_dict_key(batch):
+    """Inline copy of beit3_vendor.utils.merge_batch_tensors_by_dict_key."""
+    out = {}
+    for tk in batch[0]:
+        if isinstance(batch[0][tk], torch.Tensor):
+            out[tk] = torch.stack([d[tk] for d in batch])
+        else:
+            out[tk] = torch.tensor([d[tk] for d in batch], dtype=torch.long)
+    return out
+
+
+def _make_stub_vendor_utils():
+    """Build an in-memory stand-in for beit3_vendor/utils.py with only the
+    symbols that vendor datasets.py / modeling_finetune.py reference."""
+    import types as _types
+    m = _types.ModuleType("utils")
+    # Distributed helpers (single-process defaults).
+    m.get_rank = lambda: 0
+    m.get_world_size = lambda: 1
+    m.is_dist_avail_and_initialized = lambda: False
+    # Used by datasets.create_dataloader (we don't call it, but keep symbol).
+    m.merge_batch_tensors_by_dict_key = _merge_batch_tensors_by_dict_key
+    # Placeholder; never instantiated for captioning.
+    class _ClipLoss:  # pragma: no cover - vision-language retrieval only
+        def __init__(self, *a, **k):
+            raise RuntimeError("vendor utils.ClipLoss is not available "
+                                "in this stub (only BEiT3ForCaptioning uses).")
+    m.ClipLoss = _ClipLoss
+    return m
+
+
+def _import_beit3_vendor():
+    """Load beit3_vendor/{glossary,randaug,modeling_utils,
+    modeling_finetune,datasets}.py as private modules.
+
+    Vendor `utils.py` is NOT loaded (it pulls torchmetrics/tensorboardX
+    at module import time); a stub `utils` module is substituted into
+    sys.modules for the duration of the vendor module loads, then
+    restored. The vendor modules we use only reference utils inside
+    functions/classes that are not invoked for captioning.
+
+    Cached so subsequent calls are no-ops. Returns dict with keys:
+    datasets, modeling_finetune, modeling_utils, glossary, randaug,
+    utils (stub).
+    """
+    if _BEIT3_VENDOR_CACHE:
+        return _BEIT3_VENDOR_CACHE
+
+    import sys as _sys
+    import importlib.util as _il
+    here = os.path.dirname(__file__)
+    vendor = os.path.join(here, "beit3_vendor")
+
+    def _load(name, filename):
+        spec = _il.spec_from_file_location(
+            name, os.path.join(vendor, filename))
+        mod = _il.module_from_spec(spec)
+        _sys.modules[name] = mod  # register before exec so siblings can import
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _try_load(name, filename):
+        try:
+            return _load(name, filename)
+        except Exception as e:
+            print(f"[beit3-vendor] {filename} failed to import ({e}); "
+                  f"installing empty stub for {name!r}.")
+            import types as _types
+            m = _types.ModuleType(name)
+            _sys.modules[name] = m
+            return m
+
+    shadow_names = ("utils", "glossary", "randaug",
+                    "modeling_utils", "modeling_finetune", "datasets")
+    saved_modules = {k: _sys.modules.get(k) for k in shadow_names}
+    _sys.path.insert(0, vendor)
+    try:
+        v_utils = _make_stub_vendor_utils()
+        _sys.modules["utils"] = v_utils
+        v_gloss = _try_load("glossary", "glossary.py")
+        v_raug = _try_load("randaug", "randaug.py")
+        v_modu = _load("modeling_utils", "modeling_utils.py")
+        v_modf = _load("modeling_finetune", "modeling_finetune.py")
+        v_ds = _load("datasets", "datasets.py")
+    finally:
+        for k, v in saved_modules.items():
+            if v is None:
+                _sys.modules.pop(k, None)
+            else:
+                _sys.modules[k] = v
+        if _sys.path and _sys.path[0] == vendor:
+            _sys.path.pop(0)
+
+    _BEIT3_VENDOR_CACHE.update({
+        "utils": v_utils,
+        "glossary": v_gloss,
+        "randaug": v_raug,
+        "modeling_utils": v_modu,
+        "modeling_finetune": v_modf,
+        "datasets": v_ds,
+    })
+    return _BEIT3_VENDOR_CACHE
+
+
+def _build_beit3_train_loader(spm_path: str,
+                              data_path: str,
+                              num_train_samples: int,
+                              train_batch_size: int,
+                              captioning_mask_prob: float,
+                              num_max_bpe_tokens: int,
+                              img_size: int,
+                              num_workers: int = 0,
+                              tokenizer_dir: str | None = None):
+    """Build a small training DataLoader over COCO captioning (Karpathy
+    train+restval). Generates the jsonl index if missing.
+
+    Tokenizer loading: prefer the HF tokenizer dir (matches the eval
+    script's `AutoTokenizer.from_pretrained(..., use_fast=False)`); fall
+    back to instantiating `XLMRobertaTokenizer` from the bare .spm file."""
+    from torchvision import transforms as _tv
+
+    vendor = _import_beit3_vendor()
+    CaptioningDataset = vendor["datasets"].CaptioningDataset
+    _make_idx = vendor["datasets"]._make_captioning_coco_karpathy_dataset_index
+    _collate = _merge_batch_tensors_by_dict_key
+
+    tokenizer = None
+    if tokenizer_dir:
+        try:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                                       use_fast=False)
+            print(f"[data-beit3] tokenizer from {tokenizer_dir}")
+        except Exception as e:
+            print(f"[data-beit3] AutoTokenizer from {tokenizer_dir} failed "
+                  f"({e!r}); falling back to XLMRobertaTokenizer({spm_path}).")
+    if tokenizer is None:
+        from transformers import XLMRobertaTokenizer  # type: ignore
+        tokenizer = XLMRobertaTokenizer(spm_path)
+    train_idx = os.path.join(data_path, "coco_captioning.train.jsonl")
+    if not os.path.exists(train_idx):
+        print(f"[data-beit3] building train index at {train_idx}")
+        _make_idx(data_path, tokenizer,
+                  split=("train", "restval"), split_name="train")
+
+    transform = _tv.Compose([
+        _tv.Resize((img_size, img_size),
+                   interpolation=_tv.InterpolationMode.BICUBIC),
+        _tv.ToTensor(),
+        _tv.Normalize(mean=[0.5] * 3, std=[0.5] * 3),
+    ])
+    ds = CaptioningDataset(
+        data_path=data_path, split="train", transform=transform,
+        tokenizer=tokenizer, num_max_bpe_tokens=num_max_bpe_tokens,
+        task="coco_captioning", mask_prob=captioning_mask_prob,
+    )
+    if num_train_samples and num_train_samples > 0:
+        ds.items = ds.items[:int(num_train_samples)]
+    print(f"[data-beit3] {len(ds)} captioning samples "
+          f"(mask_prob={captioning_mask_prob})")
+
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=train_batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=False, drop_last=False,
+        collate_fn=_collate,
+    )
+    return loader, tokenizer
+
+
+@torch.no_grad()
+def _export_beit3_packed(student, num_layers: int) -> dict:
+    """Export every DeltaSVDLinear_QUANT inside student.beit3.encoder.layers
+    into the BEiT-3 packed_v1 layout: prefix.{U_q,U_scale,U_zero,V_T_q,
+    V_T_scale,V_T_zero,A_stack,B_stack,__rank}."""
+    out: dict = {}
+    n = 0
+    for li in range(num_layers):
+        for sn in LINEAR_SUBMODULE_NAMES_BEIT3:
+            try:
+                mod = student.beit3.encoder.layers[li].get_submodule(sn)
+            except AttributeError:
+                continue
+            if not isinstance(mod, DeltaSVDLinear_QUANT):
+                continue
+            prefix = _beit3_prefix(li, sn)
+            packed = _export_module_to_packed(mod)
+            for field, tensor in packed.items():
+                out[f"{prefix}.{field}"] = tensor
+            rank = int(mod.U_int.shape[1])
+            out[f"{prefix}.__rank"] = torch.tensor(rank, dtype=torch.long)
+            n += 1
+    print(f"[export-beit3] exported {n} QUANT modules")
+    return out
+
+
+def _save_beit3_packed(save_path: str,
+                       per_layer_flat: dict,
+                       meta: dict,
+                       bias_extras: dict | None = None):
+    """Write packed_v1 file for BEiT-3 in the exact on-disk schema produced
+    by compress_pipeline_beit3 (flat dict + __meta__ + .bias_delta +
+    .__rank)."""
+    sd = dict(per_layer_flat)
+    if bias_extras:
+        for k, v in bias_extras.items():
+            sd[k] = v
+    sd["__meta__"] = dict(meta)  # shallow copy
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    torch.save(sd, save_path)
+    print(f"[save-beit3] wrote {save_path}")
+
+
+def run_tuning_beit3(compressed_path: str,
+                     delta_path: str,
+                     base_ckpt: str,
+                     ft_ckpt: str,
+                     save_path: str,
+                     spm_path: str,
+                     data_path: str,
+                     tokenizer_dir: str | None = None,
+                     num_train_samples: int = 2000,
+                     train_batch_size: int = 1,
+                     grad_accum: int = 6,
+                     quant_train_epoch: int = 1,
+                     learning_rate: float = 1e-3,
+                     weight_decay: float = 0.0,
+                     warmup_ratio: float = 0.1,
+                     max_grad_norm: float = 1.0,
+                     caption_loss_weight: float = 1.0,
+                     layer_recon_loss_weight: float = 3000.0,
+                     logit_distill_weight: float = 1.0,
+                     captioning_mask_prob: float = 0.6,
+                     label_smoothing: float = 0.1,
+                     drop_worst_ratio: float = 0.0,
+                     drop_worst_after: int = 0,
+                     num_max_bpe_tokens: int = 64,
+                     img_size: int = 480,
+                     save_per_epoch: bool = False,
+                     seed: int = 0,
+                     device: str = "cuda",
+                     quant_param_train_epoch: int = 0,
+                     tuning_1: bool = False,
+                     ) -> None:
+    """BEiT-3 captioning post-quant tuning. Mirrors run_tuning() but uses
+    BEiT3ForCaptioning + COCO captioning data + BertCaptioningLoss."""
+    vendor = _import_beit3_vendor()
+    beit3_base_patch16_480_captioning = vendor["modeling_finetune"].beit3_base_patch16_480_captioning
+
+    t0 = time.time()
+    if not torch.cuda.is_available():
+        device = "cpu"
+    torch.manual_seed(seed)
+
+    print(f"[load] compressed: {compressed_path}")
+    per_layer_packed, meta = _load_packed_beit3(compressed_path)
+    group_size = int(meta["group_size"])
+    print(f"[load] {len(per_layer_packed)} layers; meta keys={list(meta)[:8]}...")
+
+    print(f"[load] delta: {delta_path}")
+    delta_sd = torch.load(delta_path, map_location="cpu")
+
+    print(f"[load] base unilm ckpt: {base_ckpt}")
+    base_sd = _beit3_load_unilm_sd(base_ckpt)
+    print(f"[load] ft unilm ckpt:   {ft_ckpt}")
+    ft_sd = _beit3_load_unilm_sd(ft_ckpt)
+
+    # Build student & teacher (both BEiT3ForCaptioning at img_size).
+    if int(img_size) == 480:
+        builder = beit3_base_patch16_480_captioning
+    else:
+        builder = vendor["modeling_finetune"].beit3_base_patch16_224_captioning
+
+    print("[load] instantiating BEiT3ForCaptioning student/teacher")
+    student = builder()
+    teacher = builder()
+    miss_s, unexp_s = student.load_state_dict(ft_sd, strict=False)
+    miss_t, unexp_t = teacher.load_state_dict(ft_sd, strict=False)
+    print(f"  student: missing={len(miss_s)} unexpected={len(unexp_s)}")
+    print(f"  teacher: missing={len(miss_t)} unexpected={len(unexp_t)}")
+
+    # Cast to bf16 and move to device.
+    student = student.to(device=device, dtype=torch.bfloat16)
+    teacher = teacher.to(device=device, dtype=torch.bfloat16)
+
+    decoder = student.beit3.encoder
+
+    # 1. Build DeltaSVDLinear modules from delta_sd (W_base from delta_sd).
+    _build_delta_svd_modules_from_delta(
+        student, delta_sd, group_size, device,
+        tuning_1=tuning_1,
+        submodule_names=LINEAR_SUBMODULE_NAMES_BEIT3,
+        prefix_fn=_beit3_prefix,
+        decoder=decoder,
+    )
+    del delta_sd
+    _clear_memory()
+
+    # 2. Replay β-absorb + Hadamard so U_unquant teacher matches.
+    _restore_beta_absorb_and_hadamard(
+        student, meta, group_size, seed=int(meta.get("seed", seed)),
+        submodule_names=LINEAR_SUBMODULE_NAMES_BEIT3,
+        decoder=decoder,
+        key_fn=_beit3_betas_key,
+    )
+    # 3. S absorbed during replay (set to 1); fold-in is no-op.
+    absorb_sigma_into_uv(student)
+
+    # 4. Quantize DeltaSVDLinear -> DeltaSVDLinear_QUANT.
+    bits = int(meta.get("bits", 4))
+    allowed_bits = meta.get("allowed_bits", None)
+    change_model_quant(student, quant_bit=bits, group_size=group_size,
+                       param_dtype=torch.bfloat16,
+                       allowed_bits=allowed_bits, decoder=decoder)
+    _clear_memory()
+
+    # 5. Overwrite quant state from compressed.pt for byte-equivalence
+    #    with merge step's input.
+    _load_quant_state_from_compressed(
+        student, per_layer_packed,
+        submodule_names=LINEAR_SUBMODULE_NAMES_BEIT3,
+        decoder=decoder,
+        prefix_fn=_beit3_prefix,
+    )
+
+    # 6. Freeze teacher.
+    for p in teacher.parameters():
+        p.requires_grad = False
+    teacher.eval()
+
+    # 7. Build COCO captioning DataLoader.
+    train_loader, _tok = _build_beit3_train_loader(
+        spm_path=spm_path,
+        data_path=data_path,
+        num_train_samples=num_train_samples,
+        train_batch_size=train_batch_size,
+        captioning_mask_prob=captioning_mask_prob,
+        num_max_bpe_tokens=num_max_bpe_tokens,
+        img_size=int(img_size),
+        tokenizer_dir=tokenizer_dir,
+    )
+
+    # 8. Train.
+    args_ns = _TuneArgs(
+        learning_rate=learning_rate, weight_decay=weight_decay,
+        warmup_ratio=warmup_ratio, max_grad_norm=max_grad_norm,
+        caption_loss_weight=caption_loss_weight,
+        layer_recon_loss_weight=layer_recon_loss_weight,
+        logit_distill_weight=logit_distill_weight,
+        grad_accum=grad_accum,
+        quant_train_epoch=quant_train_epoch,
+        quant_param_train_epoch=quant_param_train_epoch,
+        label_smoothing=label_smoothing,
+        drop_worst_ratio=drop_worst_ratio,
+        drop_worst_after=drop_worst_after,
+    )
+    print("=" * 60)
+    print(f"STEP 2: post-quant training (BEiT-3 captioning) "
+          f"quant_param_epochs={quant_param_train_epoch} "
+          f"quant_train_epochs={quant_train_epoch}")
+    print("=" * 60)
+
+    if save_per_epoch:
+        def _epoch_ckpt_cb(epoch_num, model_):
+            n_layers_ = len(model_.beit3.encoder.layers)
+            ep_per_layer = _export_beit3_packed(model_, n_layers_)
+            ep_path = save_path.replace(".pt", f".epoch{epoch_num}.pt")
+            _save_beit3_packed(ep_path, ep_per_layer, meta)
+            print(f"[ckpt] epoch {epoch_num} -> {ep_path}")
+        cb = _epoch_ckpt_cb
+    else:
+        cb = None
+
+    # Phase Q3 (optional): scale/zero tuning before A/B.
+    qp_epochs = int(quant_param_train_epoch or 0)
+    if qp_epochs > 0:
+        def _pred_qp(n):
+            return any(k in n for k in
+                       ("U_scale", "U_zero", "V_T_scale", "V_T_zero"))
+        _train_loop_beit3_captioning(
+            student, teacher, train_loader, args_ns, device,
+            num_epochs=qp_epochs, trainable_predicate=_pred_qp,
+            phase_name="step2a quant-param (beit3)",
+            epoch_callback=None,
+        )
+        for p_name, p in student.named_parameters():
+            if any(k in p_name for k in
+                   ("U_scale", "U_zero", "V_T_scale", "V_T_zero")):
+                p.requires_grad = False
+                p.grad = None
+
+    # Phase main: A/B tuning (yji0828's DeltaSVDLinear_QUANT names these
+    # `A` and `B`; SAGE_D used `A_stack`/`B_stack`).
+    def _pred(n):
+        return n.endswith(".A") or n.endswith(".B")
+    _train_loop_beit3_captioning(
+        student, teacher, train_loader, args_ns, device,
+        num_epochs=quant_train_epoch, trainable_predicate=_pred,
+        phase_name="step2 post-quant (beit3)",
+        epoch_callback=cb,
+    )
+    clear_layer_recon_teachers(student)
+
+    del teacher
+    _clear_memory()
+
+    # 9. Export every QUANT module → packed_v1 (beit3 schema).
+    n_layers = len(student.beit3.encoder.layers)
+    out_per_layer = _export_beit3_packed(student, n_layers)
+
+    # Bias_delta passthrough from input compressed (not trained).
+    _src = torch.load(compressed_path, map_location="cpu")
+    bias_extras = {k: v for k, v in _src.items() if k.endswith(".bias_delta")}
+    del _src
+    if bias_extras:
+        print(f"[tune-beit3] passthrough {len(bias_extras)} bias_delta entries")
+
+    # Trim meta to the keys cmd_merge consumes; keep informational extras.
+    out_meta = {
+        "format": "beit3_packed_v1",
+        "alpha": meta.get("alpha"),
+        "group_size": int(meta.get("group_size")),
+        "bits": int(meta.get("bits")),
+        "n_linear": int(meta.get("n_linear", n_layers * len(LINEAR_SUBMODULE_NAMES_BEIT3))),
+        "n_bias_delta": int(meta.get("n_bias_delta", len(bias_extras))),
+    }
+    _save_beit3_packed(save_path, out_per_layer, out_meta, bias_extras)
+    elapsed = time.time() - t0
+    print(f"[done] trained {len(out_per_layer) // 9} modules in {elapsed:.1f}s")
+    print(f"[done] wrote {save_path}")
+
+
+# ======================================================================
+# BEiT-3 merge — dequant + add to base, save in unilm .pth format.
+# Reuses the ft checkpoint for ft-only keys (pos_embed at 480 res,
+# mlm_head, etc.) that don't live in the base 224 ckpt.
+# ======================================================================
+
+def merge_beit3(base_ckpt: str,
+                ft_ckpt: str,
+                packed_path: str,
+                save_path: str) -> None:
+    """Reconstruct a fully-merged BEiT-3 unilm .pth checkpoint.
+
+    `packed_path` accepts either compressed.pt or tuned.pt (both have
+    format="beit3_packed_v1" with the same 8-field layout per prefix
+    plus optional bias_delta + __rank entries).
+    """
+    print(f"[merge-beit3] base = {base_ckpt}")
+    base_sd = _beit3_load_unilm_sd(base_ckpt)
+    print(f"[merge-beit3] packed = {packed_path}")
+    comp = torch.load(packed_path, map_location="cpu", weights_only=False)
+    meta = comp.pop("__meta__")
+    if meta.get("format") not in (None, "beit3_packed_v1"):
+        print(f"[warn] meta.format={meta.get('format')!r} (expected beit3_packed_v1)")
+    group_size = int(meta["group_size"])
+    print(f"[merge-beit3] meta: format={meta.get('format')!r} "
+          f"group_size={group_size} bits={meta.get('bits')}")
+
+    prefixes = sorted({
+        k.rsplit(".", 1)[0]
+        for k in comp
+        if not k.endswith(".bias_delta") and not k.endswith(".__rank")
+    })
+
+    print(f"[merge-beit3] ft_for_extras = {ft_ckpt}")
+    ft_sd = _beit3_load_unilm_sd(ft_ckpt)
+    out_sd = dict(ft_sd)  # carry over ft-only keys (mlm_head, pos_embed @480, etc.)
+
+    for prefix in tqdm(prefixes, desc="Dequant+merge"):
+        packed = {
+            "U_q": comp[f"{prefix}.U_q"],
+            "U_scale": comp[f"{prefix}.U_scale"],
+            "U_zero": comp[f"{prefix}.U_zero"],
+            "V_T_q": comp[f"{prefix}.V_T_q"],
+            "V_T_scale": comp[f"{prefix}.V_T_scale"],
+            "V_T_zero": comp[f"{prefix}.V_T_zero"],
+            "A": comp[f"{prefix}.A"],
+            "B": comp[f"{prefix}.B"],
+        }
+        delta_fp = reconstruct_delta(packed, group_size)
+        base_key = f"{prefix}.weight"
+        base_w = base_sd[base_key].to(torch.float32)
+        out_sd[base_key] = (base_w + delta_fp).to(base_sd[base_key].dtype)
+
+    n_bias = 0
+    for k, v in comp.items():
+        if not k.endswith(".bias_delta"):
+            continue
+        base_bias_key = k[:-len(".bias_delta")] + ".bias"
+        if base_bias_key in base_sd:
+            out_sd[base_bias_key] = (
+                base_sd[base_bias_key].to(torch.float32) + v.to(torch.float32)
+            ).to(base_sd[base_bias_key].dtype)
+        else:
+            out_sd[base_bias_key] = v
+        n_bias += 1
+    print(f"[merge-beit3] applied {n_bias} bias deltas")
+
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    torch.save({"model": out_sd}, save_path)
+    print(f"[merge-beit3] wrote {save_path}")

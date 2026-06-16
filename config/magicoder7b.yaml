@@ -1,15 +1,16 @@
-# WizardCoder-Python-13B (model_tag: mc)
+# config for Magicoder-S-CL-7B (model_tag: mc)
+# Mirrors wizardcoder13b.yaml; only base/finetuned model paths differ.
 
 model_root: ./data/models
 mc:
-  base_model: CodeLlama-13b-Python-hf
-  finetuned: WizardCoder-Python-13B-V1.0
+  base_model: CodeLlama-7b-Python-hf
+  finetuned: Magicoder-S-CL-7B
   calib_dataset: mbpp
   rank_min: 2
   num_train_samples: 4000
-  quant_train_epoch: 5
+  quant_train_epoch: 3
   train_data_source: magicoder
-  learning_rate: 0.02
+  learning_rate: 0.001
   weight_decay: 0.0
   warmup_ratio: 0.03
   max_grad_norm: 1.0

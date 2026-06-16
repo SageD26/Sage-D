@@ -1,15 +1,16 @@
-# WizardMath-13B (model_tag: wm)
+# config for WizardMath-7B (model_tag: wm)
+# Mirrors wizardmath13b.yaml; only base/finetuned model paths differ.
 
 model_root: ./data/models
 wm:
-  base_model: Llama-2-13b-hf
-  finetuned: WizardMath-13B-V1.0
+  base_model: Llama-2-7b-hf
+  finetuned: WizardMath-7B-V1.0
   calib_dataset: metamath
   rank_min: 2
   num_train_samples: 10000
-  quant_train_epoch: 5
+  quant_train_epoch: 3
   train_data_source: metamath
-  learning_rate: 0.02
+  learning_rate: 0.001
   weight_decay: 0.0
   warmup_ratio: 0.03
   max_grad_norm: 1.0
